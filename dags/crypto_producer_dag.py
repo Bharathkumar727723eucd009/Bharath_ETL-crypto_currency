@@ -28,6 +28,8 @@ from kafka.errors import KafkaError
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.utils.email import send_email
+
 
 
 # ════════════════════════════════════════════
@@ -146,6 +148,12 @@ def on_failure_callback(context):
 def on_success_callback(context):
    dag_id = context["task_instance"].dag_id
    exec_date = context["execution_date"]
+   subject = f"DAG Success: {dag_id}"
+   body = f"<h3>DAG {dag_id} completed successfully</h3><p>Execution date: {exec_date}</p>"
+   try:
+       send_email(to=[ALERT_EMAIL], subject=subject, html_content=body)
+   except Exception as e:
+       logger.error(f"Failed to send success email: {e}")
    logger.info(f"DAG SUCCESS: {dag_id} at {exec_date}")
 
 
@@ -350,6 +358,7 @@ def verify_kafka_delivery(**context):
 
 
        consumer.poll(timeout_ms=5000)
+       
        for tp in consumer.assignment():
            end_offset = consumer.end_offsets([tp])[tp]
            if end_offset > 0:
@@ -361,7 +370,6 @@ def verify_kafka_delivery(**context):
 
 
        msg_count = sum(len(msgs) for msgs in messages.values())
-
 
        if msg_count == 0:
            raise Exception("No messages found in Kafka after push")
@@ -395,3 +403,73 @@ def verify_kafka_delivery(**context):
        latency = int((time.time() - start) * 1000)
        log_metric(run_id, "verify_kafka_delivery", "failure", latency_ms=latency, error_message=str(e))
        raise
+
+
+#===================================
+# Task 4  : log summary 
+#===================================
+
+
+def log_run_summary(**context):
+    run_id = context["run_id"]
+    total_pushed = context["ti"].xcom_pull(task_ids="fetch_and_push_to_kafka", key="total_pushed") or 0 
+    
+    
+    log_metric(run_id , "dag_completed" ,"success",records_pushed=total_pushed)
+    logger.info(f"DAG run complete , Total record pushed ::{total_pushed}")
+    
+    
+#=======================================
+# DAG Defination 
+#=======================================
+
+
+default_args  ={
+    "owner" :"airflow",
+    "retries" : 3,
+    "retry_delays" : timedelta(seconds= 15),
+    "email" : {ALERT_EMAIL},
+    "email_on_failure" : True ,
+    "email_on_retry" : True ,
+    "email_on_success" : True ,
+    "on_failure_callback" : on_failure_callback,
+    "on_retry_callback" : on_retry_callback
+}
+
+with DAG (
+    dag_id ="Crypto_Producer",
+    default_args = default_args,
+    description = "Fetch crypto prices from coingeeko ",
+    schedule_interval = "*/1 * * * *",
+    start_date = datetime(2026,3,18),
+    catchup = False,
+    tags = ["crypto","kafka","producer"],
+    sla_miss_callback = sla_miss_callback,
+    on_success_callback = on_success_callback,
+    max_active_runs = 1
+) as dag :
+    
+    t1_kafka_health = PythonOperator(
+        task_id ="check_kafka_health",
+        python_callable = check_kafka_health,
+        sla = timedelta(seconds = 30 ),
+    )
+    t2_fetch_push = PythonOperator(
+        task_id ="fetch_and_push_to_kafka",
+        python_callable = fetch_and_push,
+        sla = timedelta(seconds = 50 ),
+    )
+    t3_verify = PythonOperator(
+        task_id ="verify_kafka_delivery",
+        python_callable = verify_kafka_delivery,
+        sla = timedelta(seconds = 30 ),
+    )
+    t4_summary = PythonOperator(
+        task_id ="log_run_summary",
+        python_callable = log_run_summary,
+        sla = timedelta(seconds = 10 ),
+    )
+    
+    t1_kafka_health >> t2_fetch_push >> t3_verify >> t4_summary
+    
+    

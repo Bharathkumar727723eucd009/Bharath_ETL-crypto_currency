@@ -1,2 +1,5 @@
 Document.txt
 .env
+logs/
+__pycache__/
+*.pyc
