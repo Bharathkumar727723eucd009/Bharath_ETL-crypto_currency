@@ -160,10 +160,126 @@ services:
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
+      - ./spark-jobs:/opt/spark-jobs
     entrypoint: /bin/bash
     command: -c "exec airflow scheduler"
     restart: on-failure
 
+
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    volumes:
+      - minio-data:/data
+      - minio-config:/root/.mc
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  spark-master:
+   image: apache/spark:3.5.1
+   container_name: spark-master
+   ports:
+     - "7077:7077"
+     - "8090:8080"
+   volumes:
+     - ./spark-jobs:/opt/spark-jobs
+   command: /opt/spark/sbin/start-master.sh
+   entrypoint: ["/bin/bash", "-c", "/opt/spark/sbin/start-master.sh && tail -f /opt/spark/logs/*"]
+
+  spark-worker:
+    image: apache/spark:3.5.1
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 1g
+    volumes:
+      - ./spark-jobs:/opt/spark-jobs
+    entrypoint: ["/bin/bash", "-c", "/opt/spark/sbin/start-worker.sh spark://spark-master:7077 && tail -f /opt/spark/logs/*"]
+
+  spark-worker-2:
+    image: apache/spark:3.5.1
+    container_name: spark-worker-2
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 1g
+    volumes:
+      - ./spark-jobs:/opt/spark-jobs
+    entrypoint: ["/bin/bash", "-c", "/opt/spark/sbin/start-worker.sh spark://spark-master:7077 && tail -f /opt/spark/logs/*"]
+  spark-streaming:
+   image: apache/spark:3.5.1
+   container_name: spark-streaming
+   user: root
+   depends_on:
+     - spark-master
+     - spark-worker
+     - kafka
+     - minio
+   volumes:
+     - ./spark-jobs:/opt/spark-jobs
+     - spark-ivy-cache:/home/spark/.ivy2
+   entrypoint: ["/bin/bash", "-c"]
+   command:
+     - |
+       mkdir -p /home/spark/.ivy2/cache /home/spark/.ivy2/jars &&
+       chmod -R 777 /home/spark/.ivy2 &&
+       /opt/spark/bin/spark-submit \
+          --master spark://spark-master:7077 \
+          --total-executor-cores 1 \
+          --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 \
+          /opt/spark-jobs/kafka_to_minio.py
+   restart: on-failure
+  spark-analytics:
+    image: apache/spark:3.5.1
+    container_name: spark-analytics
+    user: root
+    mem_limit: 2g
+    depends_on:
+      - spark-master
+      - spark-worker
+      - minio
+      - postgres
+    volumes:
+      - ./spark-jobs:/opt/spark-jobs
+      - spark-ivy-cache:/home/spark/.ivy2
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        mkdir -p /home/spark/.ivy2/cache /home/spark/.ivy2/jars &&
+        chmod -R 777 /home/spark/.ivy2 &&
+        while true; do
+          echo "Waiting for trigger..."
+          sleep 300
+            /opt/spark/bin/spark-submit \
+            --master spark://spark-master:7077 \
+            --total-executor-cores 1 \
+            --driver-memory 512m \
+            --executor-memory 512m \
+            --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262,org.postgresql:postgresql:42.7.5 \
+            /opt/spark-jobs/analytics.py
+        done
+    restart: on-failure
+    
+
 volumes:
-  pgdata:
-  airflow-db:
+ pgdata:
+ airflow-db:
+ kafka-data:
+ minio-data:
+ spark-ivy-cache:
+ minio-config:
+
+  
